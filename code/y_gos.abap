@@ -134,7 +134,9 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD store_pdf_document.
-    " xstring -> SOLIX -> SOLI (binary content for SAPoffice)
+
+
+" xstring -> SOLIX -> SOLI (binary content for SAPoffice)
     DATA(lt_solix) = cl_bcs_convert=>xstring_to_solix( iv_xstring = iv_pdf ).
 
     DATA lt_soli TYPE soli_tab.
@@ -155,11 +157,11 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
 
     " Document header attributes
     DATA ls_objdata TYPE sood1.
-    ls_objdata-objsns   = 'O'.              " standard sensitivity
+    ls_objdata-objsns   = 'O'.                       " standard sensitivity
     ls_objdata-objla    = sy-langu.
     ls_objdata-objdes   = iv_title.
     ls_objdata-file_ext = 'PDF'.
-    ls_objdata-objlen   = iv_bytecount.     " exact PDF size
+    ls_objdata-objlen   = lines( lt_soli ) * 255.    " SAPoffice expects lines*255
 
     " File name + binary format flag
     DATA lt_objhead TYPE STANDARD TABLE OF soli.
@@ -207,6 +209,7 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
 
     rs_doc_object-objtype = 'MESSAGE'.
     rs_doc_object-objkey  = ls_folmem.
+
   ENDMETHOD.
 
   METHOD create_from_spool.
@@ -258,7 +261,7 @@ ENDCLASS.
 PARAMETERS:
   p_spool  TYPE rspoid      OBLIGATORY,
   p_aufnr  TYPE aufnr       OBLIGATORY,
-  p_botype TYPE swo_objtyp  DEFAULT 'BUS2005',   " confirm BO type for COR3
+  p_botype TYPE swo_objtyp  DEFAULT 'BUS0001',   " process order (COR3)
   p_descr  TYPE so_obj_des  DEFAULT 'Attachment from spool'.
 
 START-OF-SELECTION.
