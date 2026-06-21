@@ -2,12 +2,13 @@
 *& Report  ZPP_GOS_SPOOL_TO_ORDER
 *&---------------------------------------------------------------------*
 *& Purpose : Take a spool request, convert it to PDF and attach it to a
-*&           manufacturing/process order as a GOS attachment (ATTA).
+*&           process order (COR3) as a GOS attachment (ATTA).
 *& System  : SAP S/4HANA 2023 (ABAP Platform 2023)
 *& Author  : JESUSEDM
-*& Note    : GOS is a Classic API (Clean Core level B, on-premise only).
-*&           Local class now; to be promoted to a global class later.
-*& Flow    : 1) validate order  2) spool -> PDF  3) store PDF in SAPoffice
+*& Note    : Binary content is stored via SO_DOCUMENT_INSERT_API1 with
+*&           CONTENTS_HEX (raw hex). SO_OBJECT_INSERT must NOT be used
+*&           for PDF: it corrupts binary on SAP_BASIS >= 750.
+*& Flow    : 1) validate order  2) spool -> PDF  3) store PDF (binary)
 *&           4) link document to order (binary relation 'ATTA')
 *&---------------------------------------------------------------------*
 REPORT zpp_gos_spool_to_order.
@@ -41,31 +42,26 @@ CLASS lcl_gos_attachment DEFINITION FINAL CREATE PRIVATE.
     CLASS-METHODS create_instance
       RETURNING VALUE(ro_instance) TYPE REF TO lcl_gos_attachment.
 
-    "! Reads the spool, converts it to PDF and creates the GOS
-    "! attachment on the given order.
     METHODS create_from_spool
       IMPORTING iv_spool_id    TYPE rspoid
                 iv_order       TYPE aufnr
-                iv_object_type TYPE swo_objtyp DEFAULT 'BUS2005'
+                iv_object_type TYPE sibftypeid DEFAULT 'BUS0001'
                 iv_title       TYPE so_obj_des DEFAULT 'Attachment from spool'
       RAISING   lcx_gos_error.
 
   PRIVATE SECTION.
-    "! Converts a spool request (ABAP list or OTF) into a PDF xstring.
     METHODS spool_to_pdf
       IMPORTING iv_spool_id  TYPE rspoid
       EXPORTING ev_pdf       TYPE xstring
                 ev_bytecount TYPE i
       RAISING   lcx_gos_error.
 
-    "! Stores a PDF xstring as a SAPoffice document and returns the
-    "! BOR identifier (MESSAGE) used to link it to a business object.
+    "! Stores a PDF xstring as a SAPoffice document (binary, CONTENTS_HEX)
+    "! and returns its document id for the GOS link.
     METHODS store_pdf_document
       IMPORTING iv_pdf           TYPE xstring
-                iv_bytecount     TYPE i
                 iv_title         TYPE so_obj_des
-                iv_filename      TYPE string
-      RETURNING VALUE(rs_doc_object) TYPE borident
+      RETURNING VALUE(rv_doc_id) TYPE sofolenti1-doc_id
       RAISING   lcx_gos_error.
 ENDCLASS.
 
@@ -121,7 +117,7 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
         EXPORTING iv_text = |Spool { iv_spool_id } could not be converted to PDF. SY-SUBRC={ sy-subrc }|.
     ENDIF.
 
-    " 3) Binary table -> xstring (byte count guarantees an intact PDF)
+    " 3) Binary table -> xstring
     CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
       EXPORTING input_length = ev_bytecount
       IMPORTING buffer       = ev_pdf
@@ -134,16 +130,6 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD store_pdf_document.
-
-
-" xstring -> SOLIX -> SOLI (binary content for SAPoffice)
-    DATA(lt_solix) = cl_bcs_convert=>xstring_to_solix( iv_xstring = iv_pdf ).
-
-    DATA lt_soli TYPE soli_tab.
-    CALL FUNCTION 'SO_SOLIXTAB_TO_SOLITAB'
-      EXPORTING ip_solixtab = lt_solix
-      IMPORTING ep_solitab  = lt_soli.
-
     " Root folder of the current SAPoffice user
     DATA ls_folder TYPE soodk.
     CALL FUNCTION 'SO_FOLDER_ROOT_ID_GET'
@@ -155,61 +141,34 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
         EXPORTING iv_text = |Could not read SAPoffice root folder.|.
     ENDIF.
 
-    " Document header attributes
-    DATA ls_objdata TYPE sood1.
-    ls_objdata-objsns   = 'O'.                       " standard sensitivity
-    ls_objdata-objla    = sy-langu.
-    ls_objdata-objdes   = iv_title.
-    ls_objdata-file_ext = 'PDF'.
-    ls_objdata-objlen   = lines( lt_soli ) * 255.    " SAPoffice expects lines*255
+    " Binary content as SOLIX (raw hex - no character conversion)
+    DATA(lt_solix) = cl_bcs_convert=>xstring_to_solix( iv_xstring = iv_pdf ).
 
-    " File name + binary format flag
-    DATA lt_objhead TYPE STANDARD TABLE OF soli.
-    APPEND VALUE #( line = |&SO_FILENAME={ iv_filename }| ) TO lt_objhead.
-    APPEND VALUE #( line = |&SO_FORMAT=BIN| )              TO lt_objhead.
+    " Document attributes - do NOT set doc_size when using CONTENTS_HEX
+    DATA ls_docdata TYPE sodocchgi1.
+    ls_docdata-obj_name  = 'SPOOLPDF'.
+    ls_docdata-obj_descr = iv_title.
 
-    " Insert the external (PC) document into SAPoffice
-    DATA ls_obj_id TYPE soodk.
-    CALL FUNCTION 'SO_OBJECT_INSERT'
+    DATA ls_docinfo TYPE sofolenti1.
+    CALL FUNCTION 'SO_DOCUMENT_INSERT_API1'
       EXPORTING  folder_id                  = ls_folder
-                 object_type                = 'EXT'
-                 object_hd_change           = ls_objdata
-      IMPORTING  object_id                  = ls_obj_id
-      TABLES     objhead                    = lt_objhead
-                 objcont                    = lt_soli
-      EXCEPTIONS active_user_not_exist      = 1
-                 communication_failure      = 2
-                 component_not_available    = 3
-                 dl_name_exist              = 4
-                 folder_not_exist           = 5
-                 folder_no_authorization    = 6
-                 object_type_not_exist      = 7
-                 operation_no_authorization = 8
-                 owner_not_exist            = 9
-                 parameter_error            = 10
-                 substitute_not_active      = 11
-                 substitute_not_defined     = 12
-                 system_failure             = 13
-                 x_error                    = 14
-                 OTHERS                     = 15.
+                 document_data              = ls_docdata
+                 document_type              = 'PDF'
+      IMPORTING  document_info              = ls_docinfo
+      TABLES     contents_hex               = lt_solix
+      EXCEPTIONS folder_not_exist           = 1
+                 document_type_not_exist    = 2
+                 operation_no_authorization = 3
+                 parameter_error            = 4
+                 x_error                    = 5
+                 enqueue_error              = 6
+                 OTHERS                     = 7.
     IF sy-subrc <> 0.
       RAISE EXCEPTION TYPE lcx_gos_error
-        EXPORTING iv_text = |Could not store SAPoffice document. SY-SUBRC={ sy-subrc }|.
+        EXPORTING iv_text = |Could not store SAPoffice document (SO_DOCUMENT_INSERT_API1). SY-SUBRC={ sy-subrc }|.
     ENDIF.
 
-    " Build the SAPoffice document key (folder + document) for the
-    " MESSAGE business object that GOS links to.
-    DATA ls_folmem TYPE sofmk.
-    ls_folmem-foltp = ls_folder-objtp.
-    ls_folmem-folyr = ls_folder-objyr.
-    ls_folmem-folno = ls_folder-objno.
-    ls_folmem-doctp = ls_obj_id-objtp.
-    ls_folmem-docyr = ls_obj_id-objyr.
-    ls_folmem-docno = ls_obj_id-objno.
-
-    rs_doc_object-objtype = 'MESSAGE'.
-    rs_doc_object-objkey  = ls_folmem.
-
+    rv_doc_id = ls_docinfo-doc_id.
   ENDMETHOD.
 
   METHOD create_from_spool.
@@ -226,31 +185,33 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
                   IMPORTING ev_pdf       = DATA(lv_pdf)
                             ev_bytecount = DATA(lv_size) ).
 
-    " 3) Store the PDF as a SAPoffice document
-    DATA(ls_doc) = store_pdf_document(
-      iv_pdf       = lv_pdf
-      iv_bytecount = lv_size
-      iv_title     = iv_title
-      iv_filename  = |ATTACH_{ lv_aufnr }.PDF| ).
+    " 3) Store the PDF as a SAPoffice document (binary)
+    DATA(lv_doc_id) = store_pdf_document(
+      iv_pdf   = lv_pdf
+      iv_title = iv_title ).
 
     " 4) Link the document to the order as a GOS attachment (ATTA)
-    DATA ls_bo TYPE borident.
-    ls_bo-objtype = iv_object_type.
-    ls_bo-objkey  = lv_aufnr.
+    DATA: ls_bo  TYPE sibflporb,
+          ls_doc TYPE sibflporb.
 
-    CALL FUNCTION 'BINARY_RELATION_CREATE_COMMIT'
-      EXPORTING  obj_rolea      = ls_bo
-                 obj_roleb      = ls_doc
-                 relationtype   = 'ATTA'
-      EXCEPTIONS no_model       = 1
-                 internal_error = 2
-                 unknown        = 3
-                 OTHERS         = 4.
-    IF sy-subrc <> 0.
-      RAISE EXCEPTION TYPE lcx_gos_error
-        EXPORTING iv_text = |Could not link attachment to order. SY-SUBRC={ sy-subrc }|.
-    ENDIF.
-    " BINARY_RELATION_CREATE_COMMIT commits the whole LUW internally.
+    ls_bo  = VALUE #( instid = lv_aufnr
+                      typeid = iv_object_type
+                      catid  = 'BO' ).
+    ls_doc = VALUE #( instid = lv_doc_id
+                      typeid = 'MESSAGE'
+                      catid  = 'BO' ).
+
+    TRY.
+        cl_binary_relation=>create_link(
+          is_object_a = ls_bo
+          is_object_b = ls_doc
+          ip_reltype  = 'ATTA' ).
+      CATCH cx_obl_parameter_error cx_obl_model_error cx_obl_internal_error INTO DATA(lx_obl).
+        RAISE EXCEPTION TYPE lcx_gos_error
+          EXPORTING iv_text = |Could not link attachment to order: { lx_obl->get_text( ) }|.
+    ENDTRY.
+
+    COMMIT WORK AND WAIT.
   ENDMETHOD.
 
 ENDCLASS.
@@ -261,7 +222,7 @@ ENDCLASS.
 PARAMETERS:
   p_spool  TYPE rspoid      OBLIGATORY,
   p_aufnr  TYPE aufnr       OBLIGATORY,
-  p_botype TYPE swo_objtyp  DEFAULT 'BUS0001',   " process order (COR3)
+  p_botype TYPE sibftypeid  DEFAULT 'BUS0001',   " process order (COR3)
   p_descr  TYPE so_obj_des  DEFAULT 'Attachment from spool'.
 
 START-OF-SELECTION.
