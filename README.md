@@ -15,14 +15,49 @@ Sistema ABAP SAP para anexar arquivos/documentos em Production Orders (CORN) uti
 
 ## 📋 Visão Geral
 
-Este repositório demonstra como integrar documentos e arquivos em uma Production Order do módulo PP (Planejamento de Produção) usando a classe `CL_GOS_MANAGER` do SAP. Um caso de uso comum é anexar um relatório de spool já existente (SP02) como comprovante na ordem de produção.
+Este repositório demonstra como integrar documentos e arquivos em uma Production Order do módulo PP (Planejamento de Produção) usando **GOS (Generic Object Services)**. Um caso de uso comum é anexar um relatório de spool já existente (SP02) como comprovante na ordem de produção.
 
 ### Conceitos Principais
 
 - **GOS (Generic Object Services)**: Framework do SAP que permite anexar documentos, notas e links a objetos de negócios
-- **CL_GOS_MANAGER**: Classe principal para gerenciar anexos, notas e links
-- **Production Order (CORN)**: Objeto de negócio do módulo PP (Planejamento de Produção)
+- **CL_GOS_MANAGER / CL_BINARY_RELATION**: Classes para gerenciar anexos e relações entre objetos
+- **Production Order (CORN / BUS2005)**: Objeto de negócio do módulo PP (Planejamento de Produção)
 - **Spool (SP02)**: Documento já processado/impresso no sistema
+- **SAPoffice**: Repositório de documentos para armazenar PDFs e anexos
+- **Relação ATTA**: Ligação binária que conecta um documento a uma ordem de produção
+
+---
+
+## 🔄 Fluxo do Processo
+
+O processo de anexar um spool a uma ordem é composto por **4 etapas principais**:
+
+```mermaid
+flowchart TD
+    A([Start: spool ID + order number]) --> B{Order exists in AUFK?}
+    B -- No --> E1[Raise error: order not found]
+    B -- Yes --> C[Read spool request]
+    C --> C2{ABAP list or OTF spool?}
+    C2 -- ABAP list --> D[CONVERT_ABAPSPOOLJOB_2_PDF]
+    C2 -- OTF --> D2[CONVERT_OTFSPOOLJOB_2_PDF]
+    D --> F[Binary table to xstring]
+    D2 --> F
+    F --> G[Store PDF as SAPoffice document]
+    G --> H{Document created?}
+    H -- No --> E2[Raise error: SAPoffice / authorization]
+    H -- Yes --> I[Create ATTA link: order to document]
+    I --> J[COMMIT WORK AND WAIT]
+    J --> K([Attachment visible in COR3])
+```
+
+### Passo a Passo:
+
+| Etapa | Ação | Função SAP | Saída |
+|-------|------|-----------|-------|
+| 1️⃣ **Validação** | Verificar se ordem existe em AUFK | SELECT AUFK | ordem validada |
+| 2️⃣ **Conversão** | Converter spool (ABAP list ou OTF) para PDF | `CONVERT_ABAPSPOOLJOB_2_PDF` ou `CONVERT_OTFSPOOLJOB_2_PDF` | xstring (PDF binário) |
+| 3️⃣ **Armazenamento** | Gravar PDF como documento em SAPoffice | `SO_DOCUMENT_INSERT_API1` | document_id (SO_ENTRYID) |
+| 4️⃣ **Ligação** | Criar relação ATTA entre ordem e documento | `CL_BINARY_RELATION=>create_link()` | anexo aparece em COR3 |
 
 ---
 
@@ -45,241 +80,361 @@ Criar um programa ABAP que:
 
 ---
 
-## 📝 Exemplo de Código
+## 📝 Código ABAP - Solução Completa
 
-### Programa Simples - Anexar Spool a Production Order
+### Programa Profissional: ZPP_GOS_SPOOL_TO_ORDER
 
-```abap
-*&---------------------------------------------------------------------*
-*& Report  ZGOS_ATTACH_SPOOL_TO_ORDER
-*&---------------------------------------------------------------------*
-*& Descrição: Anexa um documento de spool a uma Production Order
-*&            usando GOS (Generic Object Services)
-*&---------------------------------------------------------------------*
-
-REPORT ZGOS_ATTACH_SPOOL_TO_ORDER.
-
-PARAMETERS:
-  p_order   TYPE AUFNR DEFAULT '0000100001',  "Production Order (CORN)
-  p_spool   TYPE N_OSPHD-SPOOLID.              "Spool ID
-
-DATA:
-  lt_attachments TYPE TABLE OF stg_os_attachments,
-  ls_attachment  LIKE LINE OF lt_attachments,
-  lo_gos_manager TYPE REF TO cl_gos_manager,
-  lv_object_key  TYPE gosadmemoty-objkey,
-  lv_attachment  TYPE stg_os_attachments,
-  lx_exception   TYPE REF TO cx_root.
-
-TRY.
-  "1. Construir chave do objeto (Production Order)
-  "   Formato: <Documento>-<Número>
-  lv_object_key = p_order.
-
-  "2. Criar instância do GOS Manager
-  "   - object_type: 'MMBE' = Material, 'CORN' = Production Order, 'VBAK' = Sales Order, etc.
-  "   - object_key: Chave do objeto
-  "   - is_active: Ativa modo de visualização (TRUE = modo visualização)
-  CREATE OBJECT lo_gos_manager
-    EXPORTING
-      is_mode      = 'E'              "E=Edit, S=Show
-      is_object_type = 'CORN'         "Tipo de objeto (Production Order)
-      is_object_key  = lv_object_key  "Chave: Número da ordem
-      is_object_id   = ' '.
-
-  "3. Buscar anexos existentes (opcional)
-  CALL METHOD lo_gos_manager->get_attachments
-    IMPORTING
-      et_attachments = lt_attachments.
-
-  IF lt_attachments IS NOT INITIAL.
-    WRITE: / 'Anexos existentes encontrados:', SY-DBCNT LINES.
-  ENDIF.
-
-  "4. Adicionar novo anexo (Spool)
-  "   Opção A: Usar BDS (Business Document Service) para anexar arquivo
-  ls_attachment-classname = 'SPOOL'.      "Tipo: Spool
-  ls_attachment-filename = | Spool_{p_spool}.pdf |.
-  ls_attachment-filesize = 0.             "Será preenchido automaticamente
-  ls_attachment-langu = SY-LANGU.
-  ls_attachment-description = | Spool {p_spool} - Production Order |.
-
-  "5. Anexar usando método ADD_ATTACHMENT
-  CALL METHOD lo_gos_manager->add_attachment
-    EXPORTING
-      ps_attachment = ls_attachment
-    IMPORTING
-      ps_attachment = ls_attachment.
-
-  "6. Salvar (COMMIT) as alterações
-  CALL METHOD lo_gos_manager->save.
-
-  WRITE: / 'Spool anexado com sucesso à Production Order:', p_order.
-  WRITE: / 'ID do Arquivo:', ls_attachment-mime_type.
-
-CATCH cx_root INTO lx_exception.
-  WRITE: / 'Erro:', lx_exception->get_text( ).
-ENDTRY.
-```
-
----
-
-### Exemplo Avançado - Com Recuperação de Spool via TBTCP
+Programa completo e produção-ready (SAP S/4HANA 2023 / ABAP Platform 2023):
 
 ```abap
 *&---------------------------------------------------------------------*
-*& Report  ZGOS_ATTACH_SPOOL_ADVANCED
+*& Report  ZPP_GOS_SPOOL_TO_ORDER
 *&---------------------------------------------------------------------*
-*& Descrição: Versão avançada - recupera dados do spool de SP02
-*&            e anexa à Production Order
+*& Purpose : Take a spool request, convert it to PDF and attach it to a
+*&           manufacturing/process order as a GOS attachment (ATTA).
+*& System  : SAP S/4HANA 2023 (ABAP Platform 2023)
+*& Author  : JESUSEDM
+*& Note    : GOS is a Classic API (Clean Core level B, on-premise only).
+*&           Local class now; to be promoted to a global class later.
+*& Flow    : 1) validate order  2) spool -> PDF  3) store PDF in SAPoffice
+*&           4) link document to order (binary relation 'ATTA')
 *&---------------------------------------------------------------------*
+REPORT zpp_gos_spool_to_order.
 
-REPORT ZGOS_ATTACH_SPOOL_ADVANCED.
+"=====================================================================
+" Local exception (to be replaced by a global ZCX_* in the final class)
+"=====================================================================
+CLASS lcx_gos_error DEFINITION INHERITING FROM cx_static_check FINAL.
+  PUBLIC SECTION.
+    METHODS constructor IMPORTING iv_text TYPE string.
+    METHODS get_text REDEFINITION.
+  PRIVATE SECTION.
+    DATA mv_text TYPE string.
+ENDCLASS.
 
+CLASS lcx_gos_error IMPLEMENTATION.
+  METHOD constructor.
+    super->constructor( ).
+    mv_text = iv_text.
+  ENDMETHOD.
+  METHOD get_text.
+    result = mv_text.
+  ENDMETHOD.
+ENDCLASS.
+
+"=====================================================================
+" Local GOS service class
+"=====================================================================
+CLASS lcl_gos_attachment DEFINITION FINAL CREATE PRIVATE.
+  PUBLIC SECTION.
+    CLASS-METHODS create_instance
+      RETURNING VALUE(ro_instance) TYPE REF TO lcl_gos_attachment.
+
+    "! Reads the spool, converts it to PDF and creates the GOS
+    "! attachment on the given order.
+    METHODS create_from_spool
+      IMPORTING iv_spool_id    TYPE rspoid
+                iv_order       TYPE aufnr
+                iv_object_type TYPE sibftypeid DEFAULT 'BUS2005'
+                iv_title       TYPE so_obj_des DEFAULT 'Attachment from spool'
+      RAISING   lcx_gos_error.
+
+  PRIVATE SECTION.
+    "! Converts a spool request (ABAP list or OTF) into a PDF xstring.
+    METHODS spool_to_pdf
+      IMPORTING iv_spool_id  TYPE rspoid
+      EXPORTING ev_pdf       TYPE xstring
+                ev_bytecount TYPE i
+      RAISING   lcx_gos_error.
+
+    "! Stores a PDF xstring as a SAPoffice document and returns its id.
+    METHODS store_pdf_document
+      IMPORTING iv_pdf        TYPE xstring
+                iv_bytecount  TYPE i
+                iv_title      TYPE so_obj_des
+                iv_filename   TYPE string
+      RETURNING VALUE(rv_doc_id) TYPE so_entryid
+      RAISING   lcx_gos_error.
+ENDCLASS.
+
+CLASS lcl_gos_attachment IMPLEMENTATION.
+
+  METHOD create_instance.
+    ro_instance = NEW lcl_gos_attachment( ).
+  ENDMETHOD.
+
+  METHOD spool_to_pdf.
+    DATA lt_pdf TYPE STANDARD TABLE OF tline.
+
+    " 1) Try to interpret the spool as an ABAP list
+    CALL FUNCTION 'CONVERT_ABAPSPOOLJOB_2_PDF'
+      EXPORTING  src_spoolid              = iv_spool_id
+                 no_dialog                = abap_true
+      IMPORTING  pdf_bytecount            = ev_bytecount
+      TABLES     pdf                      = lt_pdf
+      EXCEPTIONS err_no_abap_spooljob     = 1
+                 err_no_spooljob          = 2
+                 err_no_permission        = 3
+                 err_conv_not_possible    = 4
+                 err_bad_destdevice       = 5
+                 user_cancelled           = 6
+                 err_spoolerror           = 7
+                 err_temseerror           = 8
+                 err_btcjob_open_failed   = 9
+                 err_btcjob_submit_failed = 10
+                 err_btcjob_close_failed  = 11
+                 OTHERS                   = 12.
+
+    " 2) Not an ABAP list -> fall back to OTF (SAPscript / Smart Forms)
+    IF sy-subrc = 4.
+      CLEAR: lt_pdf, ev_bytecount.
+      CALL FUNCTION 'CONVERT_OTFSPOOLJOB_2_PDF'
+        EXPORTING  src_spoolid           = iv_spool_id
+                   no_dialog             = abap_true
+        IMPORTING  pdf_bytecount         = ev_bytecount
+        TABLES     pdf                   = lt_pdf
+        EXCEPTIONS err_no_otf_spooljob   = 1
+                   err_spoolerror        = 2
+                   err_no_permission     = 3
+                   err_conv_not_possible = 4
+                   err_bad_dstdevice     = 5
+                   user_cancelled        = 6
+                   OTHERS                = 7.
+      IF sy-subrc <> 0.
+        RAISE EXCEPTION TYPE lcx_gos_error
+          EXPORTING iv_text = |Spool { iv_spool_id } (OTF) could not be converted to PDF. SY-SUBRC={ sy-subrc }|.
+      ENDIF.
+    ELSEIF sy-subrc <> 0.
+      RAISE EXCEPTION TYPE lcx_gos_error
+        EXPORTING iv_text = |Spool { iv_spool_id } could not be converted to PDF. SY-SUBRC={ sy-subrc }|.
+    ENDIF.
+
+    " 3) Binary table -> xstring (byte count guarantees an intact PDF)
+    CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
+      EXPORTING input_length = ev_bytecount
+      IMPORTING buffer       = ev_pdf
+      TABLES    binary_tab   = lt_pdf.
+
+    IF ev_pdf IS INITIAL.
+      RAISE EXCEPTION TYPE lcx_gos_error
+        EXPORTING iv_text = |PDF content is empty after converting spool { iv_spool_id }.|.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD store_pdf_document.
+    " Get the root folder of the current SAPoffice user
+    DATA ls_folder TYPE soodk.
+    CALL FUNCTION 'SO_FOLDER_ROOT_ID_GET'
+      EXPORTING  region    = 'B'
+      IMPORTING  folder_id = ls_folder
+      EXCEPTIONS OTHERS    = 1.
+    IF sy-subrc <> 0.
+      RAISE EXCEPTION TYPE lcx_gos_error
+        EXPORTING iv_text = |Could not read SAPoffice root folder (user initialized in SBWP?).|.
+    ENDIF.
+
+    " Header info: file name the attachment will be opened with
+    DATA lt_header TYPE STANDARD TABLE OF solisti1.
+    APPEND VALUE #( line = |&SO_FILENAME={ iv_filename }| ) TO lt_header.
+
+    " Document attributes
+    DATA ls_docdata TYPE sodocchgi1.
+    ls_docdata-obj_name  = 'SPOOLPDF'.
+    ls_docdata-obj_descr = iv_title.
+    ls_docdata-obj_langu = sy-langu.
+    ls_docdata-doc_size  = iv_bytecount.        " mandatory for an intact PDF
+
+    " Binary content as SOLIX
+    DATA(lt_solix) = cl_bcs_convert=>xstring_to_solix( iv_xstring = iv_pdf ).
+
+    DATA ls_docinfo TYPE sofolenti1.
+    CALL FUNCTION 'SO_DOCUMENT_INSERT_API1'
+      EXPORTING  folder_id                  = ls_folder
+                 document_data              = ls_docdata
+                 document_type              = 'PDF'
+      IMPORTING  document_info              = ls_docinfo
+      TABLES     object_header              = lt_header
+                 contents_hex               = lt_solix
+      EXCEPTIONS folder_not_exist           = 1
+                 document_type_not_exist    = 2
+                 operation_no_authorization = 3
+                 parameter_error            = 4
+                 x_error                    = 5
+                 enqueue_error              = 6
+                 OTHERS                     = 7.
+    IF sy-subrc <> 0.
+      RAISE EXCEPTION TYPE lcx_gos_error
+        EXPORTING iv_text = |Could not create SAPoffice document. SY-SUBRC={ sy-subrc } | &&
+                            |(5=x_error: check SBWP / authorizations S_OC_*).|.
+    ENDIF.
+
+    rv_doc_id = ls_docinfo-doc_id.
+  ENDMETHOD.
+
+  METHOD create_from_spool.
+    " 1) Validate the order
+    DATA(lv_aufnr) = CONV aufnr( |{ iv_order ALPHA = IN }| ).
+    SELECT SINGLE aufnr FROM aufk INTO @DATA(lv_dummy) WHERE aufnr = @lv_aufnr.
+    IF sy-subrc <> 0.
+      RAISE EXCEPTION TYPE lcx_gos_error
+        EXPORTING iv_text = |Order { lv_aufnr ALPHA = OUT } not found (AUFK).|.
+    ENDIF.
+
+    " 2) Spool -> PDF
+    spool_to_pdf( EXPORTING iv_spool_id  = iv_spool_id
+                  IMPORTING ev_pdf       = DATA(lv_pdf)
+                            ev_bytecount = DATA(lv_size) ).
+
+    " 3) Store the PDF as a SAPoffice document
+    DATA(lv_doc_id) = store_pdf_document(
+      iv_pdf       = lv_pdf
+      iv_bytecount = lv_size
+      iv_title     = iv_title
+      iv_filename  = |ATTACH_{ lv_aufnr }.PDF| ).
+
+    " 4) Link the document to the order as a GOS attachment (ATTA)
+    DATA: ls_bo  TYPE sibflporb,
+          ls_doc TYPE sibflporb.
+
+    ls_bo  = VALUE #( instid = lv_aufnr
+                      typeid = iv_object_type
+                      catid  = 'BO' ).
+    ls_doc = VALUE #( instid = lv_doc_id
+                      typeid = 'MESSAGE'
+                      catid  = 'BO' ).
+
+    TRY.
+        cl_binary_relation=>create_link(
+          is_object_a = ls_bo
+          is_object_b = ls_doc
+          ip_reltype  = 'ATTA' ).
+      CATCH cx_obl_parameter_error cx_obl_model_error cx_obl_internal_error INTO DATA(lx_obl).
+        RAISE EXCEPTION TYPE lcx_gos_error
+          EXPORTING iv_text = |Could not link attachment to order: { lx_obl->get_text( ) }|.
+    ENDTRY.
+
+    COMMIT WORK AND WAIT.
+  ENDMETHOD.
+
+ENDCLASS.
+
+"=====================================================================
+" Selection screen + execution
+"=====================================================================
 PARAMETERS:
-  p_order   TYPE AUFNR,
-  p_jobname TYPE TBTCP-JOBNAME,
-  p_jobcount TYPE TBTCP-JOBCOUNT.
+  p_spool  TYPE rspoid      OBLIGATORY,
+  p_aufnr  TYPE aufnr       OBLIGATORY,
+  p_botype TYPE sibftypeid  DEFAULT 'BUS2005',   " confirm BO type for COR3
+  p_descr  TYPE so_obj_des  DEFAULT 'Attachment from spool'.
 
-DATA:
-  lo_gos_manager   TYPE REF TO cl_gos_manager,
-  ls_attachment    TYPE stg_os_attachments,
-  lt_spool_data    TYPE TABLE OF tbtcp,
-  ls_spool         LIKE LINE OF lt_spool_data,
-  lv_file_content  TYPE XSTRING,
-  lv_object_key    TYPE gosadmemoty-objkey,
-  lx_exception     TYPE REF TO cx_root.
-
-TRY.
-
-  "1. Buscar dados do Spool (TBTCP)
-  SELECT * FROM tbtcp
-    INTO TABLE lt_spool_data
-    WHERE jobname = p_jobname
-      AND jobcount = p_jobcount.
-
-  IF lt_spool_data IS INITIAL.
-    MESSAGE E001 WITH 'Spool não encontrado'.
-  ENDIF.
-
-  READ TABLE lt_spool_data INTO ls_spool INDEX 1.
-
-  "2. Criar GOS Manager para a Production Order
-  lv_object_key = p_order.
-
-  CREATE OBJECT lo_gos_manager
-    EXPORTING
-      is_mode        = 'E'
-      is_object_type = 'CORN'
-      is_object_key  = lv_object_key.
-
-  "3. Preparar anexo com informações do Spool
-  ls_attachment-classname = 'SPOOL'.
-  ls_attachment-filename = | {ls_spool-jobname}_{ls_spool-jobcount}.txt |.
-  ls_attachment-description = | Spool Report - {ls_spool-jobname} |.
-  ls_attachment-langu = SY-LANGU.
-  ls_attachment-filetype = 'TXT'.
-
-  "4. Adicionar anexo
-  CALL METHOD lo_gos_manager->add_attachment
-    EXPORTING
-      ps_attachment = ls_attachment
-    IMPORTING
-      ps_attachment = ls_attachment.
-
-  "5. Salvar alterações
-  CALL METHOD lo_gos_manager->save.
-
-  WRITE: / 'Spool anexado com sucesso!'.
-  WRITE: / 'Production Order: ', p_order.
-  WRITE: / 'Job Spool: ', ls_spool-jobname, '/', ls_spool-jobcount.
-
-CATCH cx_root INTO lx_exception.
-  WRITE: / 'Erro ao anexar spool:', lx_exception->get_text( ).
-ENDTRY.
+START-OF-SELECTION.
+  TRY.
+      lcl_gos_attachment=>create_instance( )->create_from_spool(
+        iv_spool_id    = p_spool
+        iv_order       = p_aufnr
+        iv_object_type = p_botype
+        iv_title       = p_descr ).
+      MESSAGE |Attachment created on order { p_aufnr ALPHA = OUT }.| TYPE 'S'.
+    CATCH lcx_gos_error INTO DATA(lo_err).
+      MESSAGE lo_err->get_text( ) TYPE 'E'.
+  ENDTRY.
 ```
 
----
-
-### Exemplo - Consultar e Listar Anexos Existentes
-
-```abap
-*&---------------------------------------------------------------------*
-*& Report  ZGOS_LIST_ATTACHMENTS
-*&---------------------------------------------------------------------*
-*& Descrição: Lista todos os anexos de uma Production Order
-*&---------------------------------------------------------------------*
-
-REPORT ZGOS_LIST_ATTACHMENTS.
-
-PARAMETERS:
-  p_order TYPE AUFNR.
-
-DATA:
-  lo_gos_manager  TYPE REF TO cl_gos_manager,
-  lt_attachments  TYPE TABLE OF stg_os_attachments,
-  ls_attachment   LIKE LINE OF lt_attachments,
-  lv_object_key   TYPE gosadmemoty-objkey,
-  lx_exception    TYPE REF TO cx_root.
-
-TRY.
-
-  lv_object_key = p_order.
-
-  CREATE OBJECT lo_gos_manager
-    EXPORTING
-      is_mode        = 'S'              "S = Show mode (somente leitura)
-      is_object_type = 'CORN'
-      is_object_key  = lv_object_key.
-
-  "Obter lista de anexos
-  CALL METHOD lo_gos_manager->get_attachments
-    IMPORTING
-      et_attachments = lt_attachments.
-
-  IF lt_attachments IS INITIAL.
-    WRITE: / 'Nenhum anexo encontrado para a Production Order:', p_order.
-  ELSE.
-    WRITE: / 'Anexos da Production Order:', p_order.
-    WRITE: / SY-ULINE.
-    WRITE: / 'Arquivo', 50, 'Descrição', 100, 'Tipo'.
-    WRITE: / SY-ULINE.
-
-    LOOP AT lt_attachments INTO ls_attachment.
-      WRITE: / ls_attachment-filename,
-              ls_attachment-description,
-              ls_attachment-filetype.
-    ENDLOOP.
-  ENDIF.
-
-CATCH cx_root INTO lx_exception.
-  WRITE: / 'Erro:', lx_exception->get_text( ).
-ENDTRY.
-```
+**Recursos principais:**
+- ✅ Classe local reutilizável (`lcl_gos_attachment`)
+- ✅ Suporte para ABAP list e OTF spool
+- ✅ Conversão automática de PDF com tratamento de erros
+- ✅ Armazenamento em SAPoffice com `SO_DOCUMENT_INSERT_API1`
+- ✅ Ligação ATTA via `CL_BINARY_RELATION`
+- ✅ Mensagens de erro descritivas em inglês
+- ✅ Pronto para S/4HANA 2023
 
 ---
 
-## 🔑 Parâmetros Principais de CL_GOS_MANAGER
+## 🔑 Parâmetros de Entrada (Selection Screen)
 
-| Parâmetro | Tipo | Descrição |
-|-----------|------|-----------|
-| `is_object_type` | CHAR(4) | Tipo de objeto (CORN=Production Order, VBAK=Sales Order, MMBE=Material, etc.) |
-| `is_object_key` | STRING | Chave única do objeto (número da ordem, material, etc.) |
-| `is_mode` | CHAR(1) | E=Edit, S=Show (somente leitura) |
-| `ps_attachment` | STRUCTURE | Estrutura com dados do anexo (filename, description, etc.) |
+| Parâmetro | Tipo | Obrigatório | Descrição | Exemplo |
+|-----------|------|---------|-----------|---------|
+| `p_spool` | RSPOID | ✅ Sim | ID do spool SP02 a anexar | 12345 |
+| `p_aufnr` | AUFNR | ✅ Sim | Número da Production Order | 0000100001 |
+| `p_botype` | SIBFTYPEID | ❌ Não | Tipo de objeto (BO type) | BUS2005 (padrão) |
+| `p_descr` | SO_OBJ_DES | ❌ Não | Descrição do anexo | "Attachment from spool" |
 
 ---
 
-## 📚 Tipos de Objetos Suportados (Exemplos)
+## 🏢 Objetos de Negócio (Business Objects) Suportados
 
-| Tipo | Descrição |
-|------|-----------|
-| `CORN` | Production Order (Ordem de Produção) |
-| `VBAK` | Sales Order Header (Pedido de Venda) |
-| `MMBE` | Material Stock (Material/Estoque) |
-| `EBAN` | Purchase Requisition |
-| `EKKO` | Purchase Order Header |
-| `MKAL` | Cost Center |
+Tipos de objetos que podem ter anexos via GOS:
+
+| BO Type | Descrição | Transação |
+|---------|-----------|-----------|
+| `BUS2005` | Production Order / Manufacturing Order | CO02 |
+| `BUS2009` | Purchase Order Header | ME22N |
+| `BUS2032` | Sales Order | VA02 |
+| `BUS1001006` | Material Master | MM02 |
+| `BUS1015005` | Project | PS01 |
+| `BUS1041001` | Cost Center | KS01 |
+
+---
+
+## 🔧 Funções SAP Utilizadas
+
+## 🔧 Funções SAP Utilizadas
+
+### Conversão de Spool para PDF
+
+| Função | Uso | Suporta |
+|--------|-----|---------|
+| `CONVERT_ABAPSPOOLJOB_2_PDF` | Converter relatórios ABAP list para PDF | Relatórios simples em ABAP |
+| `CONVERT_OTFSPOOLJOB_2_PDF` | Converter documentos OTF (SAPscript/Smart Forms) para PDF | Formulários SAPscript, Smart Forms |
+| `SCMS_BINARY_TO_XSTRING` | Converter tabela binária para xstring | Conversão de tipos |
+
+### Armazenamento em SAPoffice
+
+| Função | Uso |
+|--------|-----|
+| `SO_FOLDER_ROOT_ID_GET` | Obter pasta raiz do usuário em SAPoffice |
+| `SO_DOCUMENT_INSERT_API1` | Inserir documento binário em SAPoffice |
+
+### Ligação de Objetos (GOS)
+
+| Classe | Método | Uso |
+|--------|--------|-----|
+| `CL_BINARY_RELATION` | `create_link()` | Criar relação ATTA entre ordem e documento |
+| `CL_BCS_CONVERT` | `xstring_to_solix()` | Converter xstring para formato SOLIX (SAPoffice) |
+
+---
+
+---
+
+## ⚠️ Notas Importantes & Troubleshooting
+
+### ✅ Pré-requisitos de Segurança e Configuração
+
+| Item | Verificação | Comando/Transação |
+|------|-----------|------------------|
+| 📧 **SAPoffice Inicializado** | Usuário deve ter pasta em SAPoffice | SBWP (SAPoffice) |
+| 🔐 **Permissões SAPoffice** | Roles com S_OC_* (Create, Edit, Delete) | SUIM (User Info) |
+| 🏭 **Acesso à Production Order** | Permissão de leitura em AUFK | AUFK (table check) |
+| 🗂️ **Tipo de Objeto Correto** | Confirmar `p_botype` (padrão BUS2005) | SRGBTBREL (relações) |
+
+### 🐛 Erros Comuns e Soluções
+
+| Erro | Causa | Solução |
+|------|-------|--------|
+| `err_no_abap_spooljob = 1` | Spool ID inválido ou não é ABAP list | Verificar SP02 (transação SP01) |
+| `err_no_permission = 3` | Sem permissão para ler spool | Verificar SPRO / Authorizations (S_SPO_*) |
+| `x_error = 5` | SAPoffice não inicializado ou autorização | Acessar SBWP / Executar Setup de SAPoffice |
+| `Document not found` | Ligação ATTA falhou | Verificar tipo BO em SRGBTBREL |
+
+### 📝 Checklist Antes de Executar
+
+- [ ] Production Order existe (AUFK)
+- [ ] Spool foi processado (SP02 - transação SP01)
+- [ ] Usuário tem pasta SAPoffice (SBWP)
+- [ ] Usuário tem role com S_OC_* permissions
+- [ ] Sistema é S/4HANA ou ECC 6.0+
+- [ ] `p_botype` confirmado com `SRGBTBREL` (tabela de relações)
 
 ---
 
@@ -291,34 +446,52 @@ ENDTRY.
    cd gos-order
    ```
 
-2. **Copie os programas** para seu ambiente SAP:
-   - Acesse a transação SE38 (Editor ABAP)
-   - Crie um novo programa (ex: ZGOS_ATTACH_SPOOL_TO_ORDER)
-   - Cole o código do exemplo desejado
-   - Salve e execute
+2. **Copie o programa** para seu ambiente SAP:
+   - Acesse a transação **SE38** (Editor ABAP)
+   - Crie um novo programa: **ZPP_GOS_SPOOL_TO_ORDER**
+   - Cole o código completo acima
+   - Execute **Ctrl+S** e **F9** para testar
 
 3. **Configure os parâmetros**:
-   - Production Order (CORN) válida no seu sistema
-   - Spool ID (SP02) já existente
-   - Execute F8 para testar
+   - **p_spool**: ID do spool (obtém em SP01)
+   - **p_aufnr**: Número da Production Order (AUFK)
+   - **p_botype**: Tipo de objeto (padrão BUS2005 para Production Order)
+   - **p_descr**: Descrição do anexo
+
+4. **Verifique o resultado**:
+   - Abra a Production Order em **CO03** (modo visualização)
+   - Clique em **Attachments** ou vá para aba **Attachments** (COR3)
+   - O arquivo PDF deve aparecer na lista
 
 ---
 
-## ⚠️ Notas Importantes
+## 📖 Referências SAP & Documentação
 
-- **Permissões**: Você deve ter permissão para editar a Production Order (transação CO02)
-- **Spool deve existir**: O spool SP02 deve estar processado antes de anexar
-- **Commit automático**: Use `COMMIT WORK` após `lo_gos_manager->save()` para garantir persistência
-- **Modo de teste**: Comece em modo `S` (Show) para listar anexos existentes
+### Transações Principais
 
----
+| Transação | Descrição | Uso |
+|-----------|-----------|-----|
+| **SE38** | Editor ABAP | Criar e testar programa |
+| **CO02** | Alterar Production Order | Editar ordem, ver anexos |
+| **CO03** | Visualizar Production Order | Ver anexos (COR3 - aba Attachments) |
+| **SP01** | Visualizador de Spool | Obter ID do spool, preview |
+| **SBWP** | SAPoffice Inbox | Verificar inicialização, pastas |
+| **SRGBTBREL** | Administração de Relações GOS | Confirmar tipos de objetos e relações |
 
-## 📖 Referências SAP
+### Funções & Classes
 
-- Transação **SE38**: Editor ABAP
-- Transação **CO02**: Alteração de Production Order
-- Transação **SP01/SP02**: Visualizador de Spool
-- Transação **ZGOS**: GOS Business Object Administration
+- [CONVERT_ABAPSPOOLJOB_2_PDF](https://help.sap.com/) - Converter ABAP list para PDF
+- [CONVERT_OTFSPOOLJOB_2_PDF](https://help.sap.com/) - Converter OTF para PDF
+- [SO_DOCUMENT_INSERT_API1](https://help.sap.com/) - API SAPoffice
+- [CL_BINARY_RELATION](https://help.sap.com/) - Gerenciador de relações GOS
+- [CL_BCS_CONVERT](https://help.sap.com/) - Conversão de tipos binários
+
+### Tabelas de Interesse
+
+- **AUFK** - Production Order Header
+- **TBTCP** - Spool Request Header
+- **SRGBTBREL** - Definições de Relações GOS
+- **SO_ENTRYID** - Documentos SAPoffice
 
 ---
 
@@ -334,5 +507,7 @@ Open Source - Use livremente em seus projetos SAP.
 
 ---
 
+**Versão:** 2.0  
 **Última atualização:** 2026-06-21  
-**Versão:** 1.0
+**Status:** ✅ Production-Ready (S/4HANA 2023 / ABAP Platform 2023)  
+**Autor:** JESUSEDM
