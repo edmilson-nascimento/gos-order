@@ -1,84 +1,150 @@
 *&---------------------------------------------------------------------*
 *& Report  ZPP_GOS_SPOOL_TO_ORDER
 *&---------------------------------------------------------------------*
-*& Purpose : Take a spool request, convert it to PDF and attach it to a
-*&           process order (COR3) as a GOS attachment (ATTA).
+*& Purpose : Reference example of the mature archiving class
+*&           ZCL_PP_GOS_ARCHIVE, kept here as a LOCAL final class so the
+*&           whole flow can be read in a single file.
+*&
+*&           Take a spool request produced by a print program, convert
+*&           it to PDF and attach it to a process/production order as a
+*&           GOS attachment (relation 'ATTA').
+*&
 *& System  : SAP S/4HANA 2023 (ABAP Platform 2023)
-*& Author  : JESUSEDM
+*& Author  : JESUSEDM (based on the productive class by BARATAAN)
+*&
 *& Note    : Binary content is stored via SO_DOCUMENT_INSERT_API1 with
 *&           CONTENTS_HEX (raw hex). SO_OBJECT_INSERT must NOT be used
 *&           for PDF: it corrupts binary on SAP_BASIS >= 750.
-*& Flow    : 1) validate order  2) spool -> PDF  3) store PDF (binary)
-*&           4) link document to order (binary relation 'ATTA')
+*&
+*& Flow    : 1) IS_ARCHIVE_ACTIVE - customizing check (plant + order type)
+*&           2) SPOOL_TO_PDF      - locate spool by name, convert to PDF
+*&           3) ARCHIVE_PDF       - store PDF (binary) + link 'ATTA'
 *&---------------------------------------------------------------------*
 REPORT zpp_gos_spool_to_order.
 
 "=====================================================================
-" Local exception (to be replaced by a global ZCX_* in the final class)
+" Local GOS archiving service class
+" (local mirror of the global class ZCL_PP_GOS_ARCHIVE)
 "=====================================================================
-CLASS lcx_gos_error DEFINITION INHERITING FROM cx_static_check FINAL.
+CLASS lcl_gos_archive DEFINITION FINAL.
   PUBLIC SECTION.
-    METHODS constructor IMPORTING iv_text TYPE string.
-    METHODS get_text REDEFINITION.
-  PRIVATE SECTION.
-    DATA mv_text TYPE string.
-ENDCLASS.
 
-CLASS lcx_gos_error IMPLEMENTATION.
-  METHOD constructor.
-    super->constructor( ).
-    mv_text = iv_text.
-  ENDMETHOD.
-  METHOD get_text.
-    result = mv_text.
-  ENDMETHOD.
-ENDCLASS.
+    "! Returns ABAP_TRUE when archiving is switched on for the given
+    "! plant / order type combination (driven by a fixed-value range).
+    CLASS-METHODS is_archive_active
+      IMPORTING iv_werks         TYPE werks_d
+                iv_auart         TYPE auart
+      RETURNING VALUE(rv_active) TYPE abap_bool.
 
-"=====================================================================
-" Local GOS service class
-"=====================================================================
-CLASS lcl_gos_attachment DEFINITION FINAL CREATE PRIVATE.
-  PUBLIC SECTION.
-    CLASS-METHODS create_instance
-      RETURNING VALUE(ro_instance) TYPE REF TO lcl_gos_attachment.
+    "! Locates the spool produced for the current user (by spool name and
+    "! creation time) and converts it to a PDF xstring. Tries Adobe Forms
+    "! first (FPCOMP_CREATE_PDF_FROM_SPOOL) and falls back to ABAP list.
+    CLASS-METHODS spool_to_pdf
+      IMPORTING iv_rq2name    TYPE rspo2name
+                iv_rqcretime  TYPE rspocrtime
+      RETURNING VALUE(rv_pdf) TYPE xstring.
 
-    METHODS create_from_spool
-      IMPORTING iv_spool_id    TYPE rspoid
-                iv_order       TYPE aufnr
-                iv_object_type TYPE sibftypeid DEFAULT 'BUS0001'
-                iv_title       TYPE so_obj_des DEFAULT 'Attachment from spool'
-      RAISING   lcx_gos_error.
-
-  PRIVATE SECTION.
-    METHODS spool_to_pdf
-      IMPORTING iv_spool_id  TYPE rspoid
-      EXPORTING ev_pdf       TYPE xstring
-                ev_bytecount TYPE i
-      RAISING   lcx_gos_error.
-
-    "! Stores a PDF xstring as a SAPoffice document (binary, CONTENTS_HEX)
-    "! and returns its document id for the GOS link.
-    METHODS store_pdf_document
+    "! Stores the PDF as a SAPoffice document (binary, CONTENTS_HEX) and
+    "! links it to the order as a GOS attachment ('ATTA').
+    "! Returns ABAP_TRUE when anything failed (no exception raised).
+    CLASS-METHODS archive_pdf
       IMPORTING iv_pdf           TYPE xstring
                 iv_title         TYPE so_obj_des
-      RETURNING VALUE(rv_doc_id) TYPE sofolenti1-doc_id
-      RAISING   lcx_gos_error.
+                iv_aufnr         TYPE aufnr
+                iv_object_type   TYPE sibftypeid DEFAULT 'BUS0001'
+      RETURNING VALUE(rv_failed) TYPE abap_bool.
+
 ENDCLASS.
 
-CLASS lcl_gos_attachment IMPLEMENTATION.
+CLASS lcl_gos_archive IMPLEMENTATION.
 
-  METHOD create_instance.
-    ro_instance = NEW lcl_gos_attachment( ).
+  METHOD is_archive_active.
+    DATA: lv_var   TYPE rvari_vnam,
+          lr_auart TYPE RANGE OF auart.
+
+    " Customizing range maintained per plant: ZPP_GOS_ATTACH_<WERKS>
+    lv_var = |{ 'ZPP_GOS_ATTACH_' }{ iv_werks }|.
+
+    zcl_ca_utils=>get_fixed_param_range(
+      EXPORTING  iv_name              = lv_var
+      IMPORTING  er_range             = lr_auart
+      EXCEPTIONS wrong_exp_table_type = 1
+                 OTHERS               = 2 ).
+
+    IF sy-subrc <> 0 OR lr_auart[] IS INITIAL OR
+       NOT iv_auart IN lr_auart.
+      rv_active = abap_false.
+    ELSE.
+      rv_active = abap_true.
+    ENDIF.
   ENDMETHOD.
 
   METHOD spool_to_pdf.
-    DATA lt_pdf TYPE STANDARD TABLE OF tline.
+    DATA: ls_rq        TYPE tsp01sys,
+          lt_partlist  TYPE TABLE OF adspartdesc,
+          ls_partline  LIKE LINE OF lt_partlist,
+          lv_confile   TYPE string,
+          lt_pdf       TYPE STANDARD TABLE OF tline,
+          lv_bytecount TYPE i.
 
-    " 1) Try to interpret the spool as an ABAP list
+    CLEAR rv_pdf.
+
+    " 1) Get the spool number from TSP01 (retry: spooling may lag)
+    DO 5 TIMES.
+      SELECT rqident, rqclient, rq0name, rqo1name
+        FROM tsp01 UP TO 1 ROWS
+        INTO ( @ls_rq-rqident, @ls_rq-rqclient,
+               @ls_rq-rq0name, @ls_rq-rqo1name )
+       WHERE rqclient  =   @sy-mandt
+         AND rq0name   =   'PBFORM'
+         AND rq2name   =   @iv_rq2name
+         AND rqowner   =   @sy-uname
+         AND rqfinal   IN ( 'X', 'C' )
+         AND rqcretime GE  @iv_rqcretime
+         AND rqerror   =   0
+       ORDER BY rqident.                                 "#EC CI_NOFIELD
+      ENDSELECT.
+      IF sy-subrc = 0.
+        EXIT.
+      ENDIF.
+    ENDDO.
+
+    IF ls_rq-rqident IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    " 2) Adobe Forms spool -> PDF (FPCOMP_CREATE_PDF_FROM_SPOOL)
+    CALL FUNCTION 'RSPO_ADSP_FILL_PARTLIST'
+      EXPORTING rq       = ls_rq
+      TABLES    partlist = lt_partlist.
+
+    IF lt_partlist[] IS NOT INITIAL.
+      READ TABLE lt_partlist INDEX 1 INTO ls_partline.
+
+      CALL FUNCTION 'FPCOMP_CREATE_PDF_FROM_SPOOL'
+        EXPORTING  i_spoolid      = ls_rq-rqident
+                   i_partnum      = ls_partline-adsnum
+        IMPORTING  e_pdf          = rv_pdf
+                   e_pdf_file     = lv_confile
+        EXCEPTIONS ads_error      = 1
+                   usage_error    = 2
+                   system_error   = 3
+                   internal_error = 4
+                   OTHERS         = 5.    "#EC CI_SUBRC ##FM_SUBRC_OK
+      IF sy-subrc <> 0.
+        CLEAR rv_pdf.
+      ENDIF.
+    ENDIF.
+
+    IF rv_pdf IS NOT INITIAL.
+      RETURN.
+    ENDIF.
+
+    " 3) Fallback: interpret the spool as an ABAP list
     CALL FUNCTION 'CONVERT_ABAPSPOOLJOB_2_PDF'
-      EXPORTING  src_spoolid              = iv_spool_id
+      EXPORTING  src_spoolid              = ls_rq-rqident
                  no_dialog                = abap_true
-      IMPORTING  pdf_bytecount            = ev_bytecount
+      IMPORTING  pdf_bytecount            = lv_bytecount
       TABLES     pdf                      = lt_pdf
       EXCEPTIONS err_no_abap_spooljob     = 1
                  err_no_spooljob          = 2
@@ -92,66 +158,55 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
                  err_btcjob_submit_failed = 10
                  err_btcjob_close_failed  = 11
                  OTHERS                   = 12.
-
-    " 2) Not an ABAP list -> fall back to OTF (SAPscript / Smart Forms)
-    IF sy-subrc = 4.
-      CLEAR: lt_pdf, ev_bytecount.
-      CALL FUNCTION 'CONVERT_OTFSPOOLJOB_2_PDF'
-        EXPORTING  src_spoolid           = iv_spool_id
-                   no_dialog             = abap_true
-        IMPORTING  pdf_bytecount         = ev_bytecount
-        TABLES     pdf                   = lt_pdf
-        EXCEPTIONS err_no_otf_spooljob   = 1
-                   err_spoolerror        = 2
-                   err_no_permission     = 3
-                   err_conv_not_possible = 4
-                   err_bad_dstdevice     = 5
-                   user_cancelled        = 6
-                   OTHERS                = 7.
-      IF sy-subrc <> 0.
-        RAISE EXCEPTION TYPE lcx_gos_error
-          EXPORTING iv_text = |Spool { iv_spool_id } (OTF) could not be converted to PDF. SY-SUBRC={ sy-subrc }|.
-      ENDIF.
-    ELSEIF sy-subrc <> 0.
-      RAISE EXCEPTION TYPE lcx_gos_error
-        EXPORTING iv_text = |Spool { iv_spool_id } could not be converted to PDF. SY-SUBRC={ sy-subrc }|.
+    IF sy-subrc <> 0.
+      RETURN.
     ENDIF.
 
-    " 3) Binary table -> xstring
+    " 4) Binary table -> xstring
     CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
-      EXPORTING input_length = ev_bytecount
-      IMPORTING buffer       = ev_pdf
+      EXPORTING input_length = lv_bytecount
+      IMPORTING buffer       = rv_pdf
       TABLES    binary_tab   = lt_pdf.
-
-    IF ev_pdf IS INITIAL.
-      RAISE EXCEPTION TYPE lcx_gos_error
-        EXPORTING iv_text = |PDF content is empty after converting spool { iv_spool_id }.|.
-    ENDIF.
   ENDMETHOD.
 
-  METHOD store_pdf_document.
+  METHOD archive_pdf.
+    DATA: ls_folder  TYPE soodk,
+          lv_obj_id  TYPE so_obj_id,
+          lv_size    TYPE i,
+          ls_docdata TYPE sodocchgi1,   " document attributes
+          ls_docinfo TYPE sofolenti1,   " folder entry info
+          ls_bo      TYPE sibflporb,    " local persistent object ref
+          ls_doc     TYPE sibflporb.
+
+    rv_failed = abap_false.
+
+    IF iv_pdf IS INITIAL.
+      rv_failed = abap_true.
+      RETURN.
+    ENDIF.
+
     " Root folder of the current SAPoffice user
-    DATA ls_folder TYPE soodk.
     CALL FUNCTION 'SO_FOLDER_ROOT_ID_GET'
       EXPORTING  region    = 'B'
       IMPORTING  folder_id = ls_folder
       EXCEPTIONS OTHERS    = 1.
     IF sy-subrc <> 0.
-      RAISE EXCEPTION TYPE lcx_gos_error
-        EXPORTING iv_text = |Could not read SAPoffice root folder.|.
+      rv_failed = abap_true.
+      RETURN.
     ENDIF.
 
     " Binary content as SOLIX (raw hex - no character conversion)
+    lv_size = xstrlen( iv_pdf ).
     DATA(lt_solix) = cl_bcs_convert=>xstring_to_solix( iv_xstring = iv_pdf ).
 
-    " Document attributes - do NOT set doc_size when using CONTENTS_HEX
-    DATA ls_docdata TYPE sodocchgi1.
     ls_docdata-obj_name  = 'SPOOLPDF'.
     ls_docdata-obj_descr = iv_title.
+    ls_docdata-obj_langu = sy-langu.
+    ls_docdata-doc_size  = lv_size.
+    lv_obj_id            = ls_folder.
 
-    DATA ls_docinfo TYPE sofolenti1.
     CALL FUNCTION 'SO_DOCUMENT_INSERT_API1'
-      EXPORTING  folder_id                  = ls_folder
+      EXPORTING  folder_id                  = lv_obj_id
                  document_data              = ls_docdata
                  document_type              = 'PDF'
       IMPORTING  document_info              = ls_docinfo
@@ -164,40 +219,14 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
                  enqueue_error              = 6
                  OTHERS                     = 7.
     IF sy-subrc <> 0.
-      RAISE EXCEPTION TYPE lcx_gos_error
-        EXPORTING iv_text = |Could not store SAPoffice document (SO_DOCUMENT_INSERT_API1). SY-SUBRC={ sy-subrc }|.
+      rv_failed = abap_true.
+      RETURN.
     ENDIF.
 
-    rv_doc_id = ls_docinfo-doc_id.
-  ENDMETHOD.
-
-  METHOD create_from_spool.
-    " 1) Validate the order
-    DATA(lv_aufnr) = CONV aufnr( |{ iv_order ALPHA = IN }| ).
-    SELECT SINGLE aufnr FROM aufk INTO @DATA(lv_dummy) WHERE aufnr = @lv_aufnr.
-    IF sy-subrc <> 0.
-      RAISE EXCEPTION TYPE lcx_gos_error
-        EXPORTING iv_text = |Order { lv_aufnr ALPHA = OUT } not found (AUFK).|.
-    ENDIF.
-
-    " 2) Spool -> PDF
-    spool_to_pdf( EXPORTING iv_spool_id  = iv_spool_id
-                  IMPORTING ev_pdf       = DATA(lv_pdf)
-                            ev_bytecount = DATA(lv_size) ).
-
-    " 3) Store the PDF as a SAPoffice document (binary)
-    DATA(lv_doc_id) = store_pdf_document(
-      iv_pdf   = lv_pdf
-      iv_title = iv_title ).
-
-    " 4) Link the document to the order as a GOS attachment (ATTA)
-    DATA: ls_bo  TYPE sibflporb,
-          ls_doc TYPE sibflporb.
-
-    ls_bo  = VALUE #( instid = lv_aufnr
+    ls_bo  = VALUE #( instid = iv_aufnr
                       typeid = iv_object_type
                       catid  = 'BO' ).
-    ls_doc = VALUE #( instid = lv_doc_id
+    ls_doc = VALUE #( instid = ls_docinfo-doc_id
                       typeid = 'MESSAGE'
                       catid  = 'BO' ).
 
@@ -206,9 +235,9 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
           is_object_a = ls_bo
           is_object_b = ls_doc
           ip_reltype  = 'ATTA' ).
-      CATCH cx_obl_parameter_error cx_obl_model_error cx_obl_internal_error INTO DATA(lx_obl).
-        RAISE EXCEPTION TYPE lcx_gos_error
-          EXPORTING iv_text = |Could not link attachment to order: { lx_obl->get_text( ) }|.
+      CATCH cx_obl_parameter_error cx_obl_model_error cx_obl_internal_error.
+        rv_failed = abap_true.
+        RETURN.
     ENDTRY.
 
     COMMIT WORK AND WAIT.
@@ -217,22 +246,40 @@ CLASS lcl_gos_attachment IMPLEMENTATION.
 ENDCLASS.
 
 "=====================================================================
-" Selection screen + execution
+" Selection screen + execution (demo wiring of the 3 steps)
 "=====================================================================
 PARAMETERS:
-  p_spool  TYPE rspoid      OBLIGATORY,
+  p_werks  TYPE werks_d     OBLIGATORY,
+  p_auart  TYPE auart       OBLIGATORY,
+  p_rq2nam TYPE rspo2name   OBLIGATORY,           " spool name (RQ2NAME)
+  p_rqtime TYPE rspocrtime  OBLIGATORY,           " spool creation time (lower bound)
   p_aufnr  TYPE aufnr       OBLIGATORY,
-  p_botype TYPE sibftypeid  DEFAULT 'BUS0001',   " process order (COR3)
+  p_botype TYPE sibftypeid  DEFAULT 'BUS0001',    " process order business object
   p_descr  TYPE so_obj_des  DEFAULT 'Attachment from spool'.
 
 START-OF-SELECTION.
-  TRY.
-      lcl_gos_attachment=>create_instance( )->create_from_spool(
-        iv_spool_id    = p_spool
-        iv_order       = p_aufnr
-        iv_object_type = p_botype
-        iv_title       = p_descr ).
-      MESSAGE |Attachment created on order { p_aufnr ALPHA = OUT }.| TYPE 'S'.
-    CATCH lcx_gos_error INTO DATA(lo_err).
-      MESSAGE lo_err->get_text( ) TYPE 'E'.
-  ENDTRY.
+
+  " 1) Skip silently when archiving is not active for plant/order type
+  IF lcl_gos_archive=>is_archive_active( iv_werks = p_werks
+                                         iv_auart = p_auart ) = abap_false.
+    MESSAGE |Archiving not active for plant { p_werks } / order type { p_auart }.| TYPE 'S'.
+    RETURN.
+  ENDIF.
+
+  " 2) Locate the spool and convert it to PDF
+  DATA(lv_pdf) = lcl_gos_archive=>spool_to_pdf( iv_rq2name   = p_rq2nam
+                                                iv_rqcretime = p_rqtime ).
+  IF lv_pdf IS INITIAL.
+    MESSAGE |Spool { p_rq2nam } could not be converted to PDF.| TYPE 'E'.
+    RETURN.
+  ENDIF.
+
+  " 3) Store the PDF and attach it to the order
+  IF lcl_gos_archive=>archive_pdf( iv_pdf         = lv_pdf
+                                   iv_title       = p_descr
+                                   iv_aufnr       = p_aufnr
+                                   iv_object_type = p_botype ) = abap_true.
+    MESSAGE |Could not attach the PDF to order { p_aufnr ALPHA = OUT }.| TYPE 'E'.
+  ELSE.
+    MESSAGE |Attachment created on order { p_aufnr ALPHA = OUT }.| TYPE 'S'.
+  ENDIF.
